@@ -4,6 +4,16 @@ import pandas as pd
 from PyQt6.QtWidgets import QApplication
 
 
+def _runtime_dh_to_hms(runtime_dh: float) -> str:
+    """Convert RunTime_dh decimal hours to HH:MM:SS for clipboard export."""
+    total_seconds = int(round((runtime_dh % 24.0) * 3600.0))
+    total_seconds %= 24 * 3600
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    seconds = total_seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
 def average_dataframe_by_runtime(df: pd.DataFrame, seconds: int) -> pd.DataFrame:
     """Return a runtime-binned copy of numeric values for clipboard export."""
     if seconds <= 1 or "RunTime_dh" not in df.columns:
@@ -27,8 +37,11 @@ def dataframe_selection_to_tsv(
         return ""
 
     start, end = sorted((start_dh, end_dh))
-    columns = ["RunTime_dh"] + [column for column in visible_columns if column in df.columns]
-    selected = df.loc[(df["RunTime_dh"] >= start) & (df["RunTime_dh"] <= end), columns]
+    value_columns = [column for column in visible_columns if column in df.columns]
+    columns = ["RunTime_dh"] + value_columns
+    selected = df.loc[(df["RunTime_dh"] >= start) & (df["RunTime_dh"] <= end), columns].copy()
+    selected.insert(0, "Time", selected["RunTime_dh"].map(_runtime_dh_to_hms))
+    selected = selected.drop(columns=["RunTime_dh"])
     return selected.to_csv(sep="\t", index=False, float_format="%.9g")
 
 

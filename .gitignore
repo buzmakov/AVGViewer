@@ -1,5 +1,8 @@
 LV-Programs
 клонидин*
 avg-viewer/.venv/
+avg-viewer/build/
+avg-viewer/dist/
+avg-viewer/AVGViewer.spec
 __pycache__/
 *.pyc
