@@ -4,6 +4,18 @@ import pandas as pd
 from PyQt6.QtWidgets import QApplication
 
 
+def average_dataframe_by_runtime(df: pd.DataFrame, seconds: int) -> pd.DataFrame:
+    """Return a runtime-binned copy of numeric values for clipboard export."""
+    if seconds <= 1 or "RunTime_dh" not in df.columns:
+        return df.copy()
+
+    seconds_of_day = df["RunTime_dh"] * 3600.0
+    bin_index = (seconds_of_day // seconds).astype("int64")
+    numeric_columns = df.select_dtypes(include="number").columns.tolist()
+    grouped = df[numeric_columns].groupby(bin_index, sort=True).mean(numeric_only=True)
+    return grouped.reset_index(drop=True)
+
+
 def dataframe_selection_to_tsv(
     df: pd.DataFrame,
     visible_columns: list[str],

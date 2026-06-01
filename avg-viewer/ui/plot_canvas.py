@@ -25,6 +25,7 @@ class PlotCanvas(FigureCanvasQTAgg):
 
     selection_changed = pyqtSignal(float, float)
     cursor_changed = pyqtSignal(float, float)
+    x_limits_changed = pyqtSignal(float, float, float, float)
 
     def __init__(self, parent=None) -> None:
         self.figure = Figure(figsize=(8, 5), constrained_layout=True)
@@ -33,16 +34,15 @@ class PlotCanvas(FigureCanvasQTAgg):
         self.setParent(parent)
 
         self._avg_df: pd.DataFrame | None = None
-        self._display_df: pd.DataFrame | None = None
         self._mph_df: pd.DataFrame | None = None
         self._marks: list[dict[str, Any]] = []
         self._visible_columns: list[str] = []
-        self._averaging_seconds = 2
         self._selection_start: float | None = None
         self._selection_end: float | None = None
         self._selection_patch: Rectangle | None = None
         self._dragging = False
         self._current_xlim: tuple[float, float] | None = None
+        self._full_xlim: tuple[float, float] | None = None
         self._x_zoom_factor = 1.25
 
         self.mpl_connect("button_press_event", self._on_button_press)
@@ -59,9 +59,13 @@ class PlotCanvas(FigureCanvasQTAgg):
         return start, end
 
     @property
-    def display_df(self) -> pd.DataFrame | None:
-        """Return the currently displayed physical-values DataFrame after averaging."""
-        return self._display_df
+    def avg_df(self) -> pd.DataFrame | None:
+        """Return the source AVG DataFrame used for plotting."""
+        return self._avg_df
+
+    @property
+    def mph_overlay_visible(self) -> bool:
+        return self._mph_df is not None and not self._mph_df.empty
 
     def set_data(
         self,
@@ -76,77 +80,130 @@ class PlotCanvas(FigureCanvasQTAgg):
         self._selection_start = None
         self._selection_end = None
         self._current_xlim = None
+        self._full_xlim = self._calculate_full_xlim()
         self.redraw()
 
     def set_visible_columns(self, visible_columns: list[str]) -> None:
         self._visible_columns = visible_columns
         self.redraw()
 
-    def set_averaging_seconds(self, seconds: int) -> None:
-        self._averaging_seconds = max(1, int(seconds))
-        self.redraw()
-
     def set_mph_overlay(self, mph_df: pd.DataFrame | None) -> None:
         self._mph_df = mph_df
         self.redraw()
 
-    def _make_display_df(self) -> pd.DataFrame | None:
-        if self._avg_df is None or "RunTime_dh" not in self._avg_df.columns:
-            return self._avg_df
-        df = self._avg_df.copy()
-        if self._averaging_seconds <= 1:
-            return df
+    def clear_mph_overlay(self) -> None:
+        self._mph_df = None
+        self.redraw()
 
-        seconds_of_day = df["RunTime_dh"] * 3600.0
-        bin_index = (seconds_of_day // self._averaging_seconds).astype("int64")
-        numeric_columns = df.select_dtypes(include="number").columns.tolist()
-        grouped = df[numeric_columns].groupby(bin_index, sort=True).mean(numeric_only=True)
-        return grouped.reset_index(drop=True)
+    def set_time_window_start_fraction(self, fraction: float) -> None:
+        if self._full_xlim is None or self._current_xlim is None:
+            return
+        full_left, full_right = self._full_xlim
+        view_left, view_right = self._current_xlim
+        full_width = full_right - full_left
+        view_width = view_right - view_left
+        if full_width <= 0 or view_width <= 0 or view_width >= full_width:
+            return
 
-    @staticmethod
-    def _normalized_series(series: pd.Series) -> pd.Series:
-        mean = series.mean(skipna=True)
-        std = series.std(skipna=True)
-        if pd.isna(std) or std == 0:
-            return series * 0.0
-        return (series - mean) / std
+        fraction = min(1.0, max(0.0, fraction))
+        new_left = full_left + fraction * (full_width - view_width)
+        self.set_time_window(new_left, new_left + view_width)
+
+    def center_on_time(self, runtime_dh: float) -> None:
+        if self._full_xlim is None:
+            return
+        full_left, full_right = self._full_xlim
+        full_width = full_right - full_left
+        if full_width <= 0:
+            return
+
+        if self._current_xlim is not None:
+            view_width = self._current_xlim[1] - self._current_xlim[0]
+        else:
+            view_width = min(full_width, 5.0 / 60.0)
+        if view_width <= 0 or view_width > full_width:
+            view_width = full_width
+
+        left = runtime_dh - view_width / 2.0
+        right = runtime_dh + view_width / 2.0
+        self.set_time_window(left, right)
+
+    def set_time_window(self, left: float, right: float) -> None:
+        if self._full_xlim is not None:
+            full_left, full_right = self._full_xlim
+            full_width = full_right - full_left
+            view_width = right - left
+            if full_width > 0 and view_width > 0:
+                if view_width >= full_width:
+                    left, right = full_left, full_right
+                elif left < full_left:
+                    left = full_left
+                    right = left + view_width
+                elif right > full_right:
+                    right = full_right
+                    left = right - view_width
+
+        self._current_xlim = (left, right)
+        self.axes.set_xlim(left, right)
+        self._emit_x_limits_changed()
+        self.draw_idle()
+
+    def _calculate_full_xlim(self) -> tuple[float, float] | None:
+        if self._avg_df is None:
+            return None
+        if "RunTime_dh" in self._avg_df.columns:
+            x = self._avg_df["RunTime_dh"].dropna()
+        else:
+            x = pd.Series(self._avg_df.index)
+        if x.empty:
+            return None
+        left = float(x.min())
+        right = float(x.max())
+        if left == right:
+            right = left + 1e-9
+        return left, right
 
     def redraw(self) -> None:
         self.axes.clear()
         self._selection_patch = None
 
-        self._display_df = self._make_display_df()
-        if self._display_df is None or not self._visible_columns:
+        if self._avg_df is None or not self._visible_columns:
             self.axes.set_title("Откройте AVG-файл и выберите серии")
             self.axes.set_xlabel("RunTime_dh")
             self.draw_idle()
             return
 
-        x = self._display_df["RunTime_dh"] if "RunTime_dh" in self._display_df.columns else self._display_df.index
-        for column in self._visible_columns:
-            if column in self._display_df.columns:
-                y = self._normalized_series(self._display_df[column])
-                self.axes.plot(x, y, label=column, linewidth=1.2)
+        if self._full_xlim is None:
+            self._full_xlim = self._calculate_full_xlim()
 
-        self._draw_marks()
+        x = self._avg_df["RunTime_dh"] if "RunTime_dh" in self._avg_df.columns else self._avg_df.index
+        for column in self._visible_columns:
+            if column in self._avg_df.columns:
+                self.axes.plot(x, self._avg_df[column], label=column, linewidth=1.2)
+
         self._draw_mph_overlay()
+        self.axes.relim()
+        self.axes.autoscale_view(scalex=False, scaley=True)
+        self._draw_marks()
         self._draw_selection_patch()
 
         self.axes.set_xlabel("Время")
-        self.axes.set_ylabel("Нормированное отклонение (z-score)")
-        self.axes.set_title(f"Сопоставимый масштаб, усреднение {self._averaging_seconds} с")
+        self.axes.set_ylabel("Значение")
+        self.axes.set_title("AVG")
         self.axes.xaxis.set_major_formatter(FuncFormatter(lambda value, _pos: runtime_dh_to_hms(value)))
         self.axes.grid(True, alpha=0.25)
         if self._current_xlim is not None:
             self.axes.set_xlim(*self._current_xlim)
+        elif self._full_xlim is not None:
+            self.axes.set_xlim(*self._full_xlim)
         if self._visible_columns:
             self.axes.legend(loc="best", fontsize="small")
+        self._emit_x_limits_changed()
         self.draw_idle()
 
     def _draw_marks(self) -> None:
         if not self._marks:
             return
-        ymin, ymax = self.axes.get_ylim()
         for mark in self._marks:
             runtime = mark.get("runtime_dh")
             if runtime is None:
@@ -155,7 +212,7 @@ class PlotCanvas(FigureCanvasQTAgg):
             self.axes.axvline(runtime, color="tab:red", linestyle="--", linewidth=0.8, alpha=0.65)
             self.axes.text(
                 runtime,
-                ymax,
+                0.98,
                 label,
                 rotation=90,
                 va="top",
@@ -163,6 +220,8 @@ class PlotCanvas(FigureCanvasQTAgg):
                 fontsize=8,
                 color="tab:red",
                 alpha=0.8,
+                transform=self.axes.get_xaxis_transform(),
+                clip_on=True,
             )
 
     def _draw_mph_overlay(self) -> None:
@@ -173,8 +232,7 @@ class PlotCanvas(FigureCanvasQTAgg):
         x = self._mph_df["RunTime_dh"]
         for column in self._visible_columns:
             if column in self._mph_df.columns:
-                y = self._normalized_series(self._mph_df[column])
-                self.axes.plot(x, y, linestyle="none", marker=".", markersize=2, alpha=0.55)
+                self.axes.plot(x, self._mph_df[column], linestyle="none", marker=".", markersize=2, alpha=0.55)
 
     def _draw_selection_patch(self) -> None:
         selected = self.selection
@@ -191,6 +249,18 @@ class PlotCanvas(FigureCanvasQTAgg):
             edgecolor="tab:green",
         )
         self.axes.add_patch(self._selection_patch)
+
+    def _emit_x_limits_changed(self) -> None:
+        if self._full_xlim is None:
+            return
+        view_left, view_right = self.axes.get_xlim()
+        self._current_xlim = (float(view_left), float(view_right))
+        self.x_limits_changed.emit(
+            self._full_xlim[0],
+            self._full_xlim[1],
+            float(view_left),
+            float(view_right),
+        )
 
     def _on_button_press(self, event) -> None:
         if event.button != 1 or event.inaxes != self.axes or event.xdata is None:
@@ -218,9 +288,7 @@ class PlotCanvas(FigureCanvasQTAgg):
         new_left = cursor_x - new_width * left_fraction
         new_right = cursor_x + new_width * right_fraction
 
-        self._current_xlim = (new_left, new_right)
-        self.axes.set_xlim(new_left, new_right)
-        self.draw_idle()
+        self.set_time_window(new_left, new_right)
 
     def _on_motion(self, event) -> None:
         if event.inaxes == self.axes and event.xdata is not None and event.ydata is not None:
