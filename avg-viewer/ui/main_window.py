@@ -1,0 +1,191 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+from matplotlib.backends.backend_qt import NavigationToolbar2QT
+from PyQt6.QtCore import QSettings
+from PyQt6.QtGui import QAction, QKeySequence
+from PyQt6.QtWidgets import (
+    QFileDialog,
+    QComboBox,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QSplitter,
+    QVBoxLayout,
+    QWidget,
+)
+
+from data.series import ExperimentSeries
+from ui.channel_panel import ChannelPanel
+from ui.plot_canvas import PlotCanvas, runtime_dh_to_hms
+from utils.clipboard import copy_selection_to_clipboard
+
+
+class MainWindow(QMainWindow):
+    """Main application window."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("AVG Viewer")
+        self.resize(1200, 800)
+
+        self.settings = QSettings("AVGViewer", "AVGViewer")
+        self.series: ExperimentSeries | None = None
+        self.selection: tuple[float, float] | None = None
+
+        self._build_ui()
+        self._build_menu()
+        self._update_actions()
+
+    def _build_ui(self) -> None:
+        central = QWidget()
+        main_layout = QVBoxLayout(central)
+
+        main_layout.setContentsMargins(4, 4, 4, 4)
+        main_layout.setSpacing(4)
+
+        splitter = QSplitter()
+        self.channel_panel = ChannelPanel()
+        self.channel_panel.setMinimumWidth(220)
+        self.channel_panel.channels_changed.connect(self._on_channels_changed)
+
+        plot_container = QWidget()
+        plot_layout = QVBoxLayout(plot_container)
+        plot_layout.setContentsMargins(0, 0, 0, 0)
+        plot_layout.setSpacing(2)
+        self.plot_canvas = PlotCanvas()
+        self.plot_canvas.selection_changed.connect(self._on_selection_changed)
+        self.plot_canvas.cursor_changed.connect(self._on_cursor_changed)
+        self.toolbar = NavigationToolbar2QT(self.plot_canvas, self)
+        plot_layout.addWidget(self.toolbar)
+        plot_layout.addWidget(self.plot_canvas)
+
+        splitter.addWidget(self.channel_panel)
+        splitter.addWidget(plot_container)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        main_layout.addWidget(splitter)
+
+        buttons_layout = QHBoxLayout()
+        self.averaging_combo = QComboBox()
+        for seconds in (1, 2, 5, 10, 60):
+            self.averaging_combo.addItem(f"{seconds} с", seconds)
+        self.averaging_combo.setCurrentIndex(1)
+        self.averaging_combo.currentIndexChanged.connect(self._on_averaging_changed)
+        self.copy_button = QPushButton("Copy selection TSV (Ctrl+C)")
+        self.copy_button.clicked.connect(self._copy_selection)
+        self.mph_button = QPushButton("Показать MPH в выделении")
+        self.mph_button.clicked.connect(self._show_mph_for_selection)
+        buttons_layout.addWidget(QLabel("Усреднение:"))
+        buttons_layout.addWidget(self.averaging_combo)
+        buttons_layout.addStretch(1)
+        buttons_layout.addWidget(self.mph_button)
+        buttons_layout.addWidget(self.copy_button)
+        main_layout.addLayout(buttons_layout)
+
+        self.setCentralWidget(central)
+        self.statusBar().showMessage("Готово")
+
+    def _build_menu(self) -> None:
+        file_menu = self.menuBar().addMenu("File")
+        open_action = file_menu.addAction("Open AVG...")
+        open_action.triggered.connect(self.open_avg_dialog)
+        file_menu.addSeparator()
+        quit_action = file_menu.addAction("Exit")
+        quit_action.triggered.connect(self.close)
+
+        self.copy_action = QAction("Copy selection TSV", self)
+        self.copy_action.setShortcut(QKeySequence.StandardKey.Copy)
+        self.copy_action.triggered.connect(self._copy_selection)
+        self.addAction(self.copy_action)
+
+    def open_avg_dialog(self) -> None:
+        last_dir = self.settings.value("last_dir", str(Path.cwd()), str)
+        filename, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open AVG file",
+            last_dir,
+            "AVG files (*.AVG);;All files (*.*)",
+        )
+        if filename:
+            self.settings.setValue("last_dir", str(Path(filename).parent))
+            self.open_avg(Path(filename))
+
+    def open_avg(self, path: Path) -> None:
+        try:
+            self.series = ExperimentSeries(path)
+            avg_df = self.series.load_avg()
+            marks = self.series.load_marks()
+            visible_columns = self.series.visible_columns()
+            default_columns = [column for column in ["HR, bpm", "Mean BP", "Syst BP", "Diast BP"] if column in visible_columns]
+            self.channel_panel.set_channels(visible_columns, checked=default_columns or visible_columns[:3])
+            self.plot_canvas.set_averaging_seconds(int(self.averaging_combo.currentData()))
+            self.plot_canvas.set_data(avg_df, self.channel_panel.selected_channels(), marks)
+            self.selection = None
+            self.statusBar().showMessage(
+                f"{self.series.name} — AVG rows: {len(avg_df)}, Marks: {len(marks)}, "
+                f"Files: {', '.join(self.series.available_files)}"
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Ошибка открытия файла", str(exc))
+        finally:
+            self._update_actions()
+
+    def _on_channels_changed(self, channels: list[str]) -> None:
+        self.plot_canvas.set_visible_columns(channels)
+        self._update_actions()
+
+    def _on_averaging_changed(self) -> None:
+        self.plot_canvas.set_averaging_seconds(int(self.averaging_combo.currentData()))
+
+    def _on_selection_changed(self, start_dh: float, end_dh: float) -> None:
+        self.selection = (start_dh, end_dh)
+        self.statusBar().showMessage(
+            f"Выделено: {runtime_dh_to_hms(start_dh)} — {runtime_dh_to_hms(end_dh)}"
+        )
+        self._update_actions()
+
+    def _on_cursor_changed(self, x: float, y: float) -> None:
+        self.statusBar().showMessage(f"t={runtime_dh_to_hms(x)}, y={y:.4g}")
+
+    def _copy_selection(self) -> None:
+        if self.series is None or self.selection is None:
+            return
+        try:
+            start, end = self.selection
+            source_df = self.plot_canvas.display_df
+            if source_df is None:
+                source_df = self.series.load_avg()
+            row_count = copy_selection_to_clipboard(
+                source_df,
+                self.channel_panel.selected_channels(),
+                start,
+                end,
+            )
+            self.statusBar().showMessage(f"Скопировано строк: {row_count}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Ошибка копирования", str(exc))
+
+    def _show_mph_for_selection(self) -> None:
+        if self.series is None or self.selection is None:
+            return
+        try:
+            start, end = self.selection
+            mph_df = self.series.load_mph()
+            if "RunTime_dh" in mph_df.columns:
+                mph_df = mph_df[(mph_df["RunTime_dh"] >= start) & (mph_df["RunTime_dh"] <= end)]
+            self.plot_canvas.set_mph_overlay(mph_df)
+            self.statusBar().showMessage(f"MPH-точек в выделении: {len(mph_df)}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Ошибка загрузки MPH", str(exc))
+
+    def _update_actions(self) -> None:
+        has_selection = self.series is not None and self.selection is not None
+        can_copy = has_selection and bool(self.channel_panel.selected_channels())
+        self.copy_button.setEnabled(can_copy)
+        if hasattr(self, "copy_action"):
+            self.copy_action.setEnabled(can_copy)
+        self.mph_button.setEnabled(has_selection and self.series is not None and self.series.mph_path.exists())
